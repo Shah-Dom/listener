@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="referrer" content="no-referrer">
+  <title>Audio Sentinel · Private live audio</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #111820; color: #edf2f7; padding: 24px 16px; }
+    main { width: min(100%, 520px); margin: 0 auto; }
+    h1 { font-size: 1.45rem; margin: 0 0 8px; }
+    p { color: #aebdca; line-height: 1.5; }
+    .panel { background: #1b2632; border: 1px solid #30404e; border-radius: 14px; padding: 18px; margin-top: 18px; }
+    label { display: block; font-size: .95rem; margin: 0 0 8px; }
+    input { width: 100%; padding: 13px 14px; border-radius: 9px; border: 1px solid #536474; background: #0e151c; color: #fff; font-size: 1rem; }
+    button { border: 0; border-radius: 9px; padding: 13px 18px; font-size: 1rem; font-weight: 650; cursor: pointer; margin: 12px 8px 0 0; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    #listen { background: #d18a4c; color: #17120e; }
+    #stop { background: #8e4540; color: white; }
+    #status { background: #101820; border-radius: 9px; padding: 12px; min-height: 48px; margin-top: 16px; color: #e4ebf1; }
+    .meter { height: 12px; background: #0e151c; border-radius: 8px; overflow: hidden; margin: 18px 0 8px; }
+    #level { height: 100%; width: 0; background: #d18a4c; transition: width .08s linear; }
+    input[type=range] { padding: 0; accent-color: #d18a4c; }
+    .small { font-size: .82rem; color: #91a1af; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Audio Sentinel</h1>
+  <p>Private live audio from your Audio Sentinel device. Enter the listener password, then tap Listen.</p>
+  <section class="panel">
+    <label for="password">Listener password</label>
+    <input id="password" type="password" autocomplete="current-password" spellcheck="false" maxlength="512" placeholder="Enter your password">
+    <button id="listen" type="button">Listen</button>
+    <button id="stop" type="button" disabled>Stop &amp; end session</button>
+    <div id="status" role="status" aria-live="polite">Not connected. The device must have an active /live session.</div>
+    <div class="meter" aria-label="Audio level"><div id="level"></div></div>
+    <label for="volume">Volume</label>
+    <input id="volume" type="range" min="0" max="100" value="65">
+    <p id="timer" class="small"></p>
+  </section>
+  <p class="small">Audio is forwarded in memory only; this relay does not record or store the stream. Sessions end when you stop, disconnect, or reach the server-enforced five-minute limit. Keep this page open and the screen on; mobile browsers may pause audio in the background. Only listen where you have the necessary consent.</p>
+</main>
+<script>
+(() => {
+  "use strict";
+  const API = "https://audiosentinel-relay.mrkarimi80.workers.dev";
+  const requestedDuration = Number(new URLSearchParams(location.search).get("duration"));
+  const MAX_SESSION_SECONDS = Number.isFinite(requestedDuration) && requestedDuration >= 1
+    ? Math.min(5 * 60, Math.floor(requestedDuration))
+    : 5 * 60;
+  const IMA_INDEX = [-1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8];
+  const IMA_STEP = [7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767];
+
+  const $ = id => document.getElementById(id);
+  const statusEl = $("status"), listenBtn = $("listen"), stopBtn = $("stop");
+  const passwordEl = $("password"), levelEl = $("level"), timerEl = $("timer");
+  let socket = null, audio = null, gain = null, nextTime = 0, sampleRate = 16000;
+  let ended = false, sessionStartedAt = 0, timerHandle = 0;
+
+  function say(message) { statusEl.textContent = message; }
+  function setConnected(value) {
+    listenBtn.disabled = value;
+    stopBtn.disabled = !value;
+  }
+  function decodeFrame(bytes) {
+    if (bytes.length < 5) return null;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const type = bytes[0], count = view.getUint16(3, true);
+    if (count < 1 || count > 4000) return null;
+    if (type === 1) {
+      if (bytes.length < 8 + ((count + 1) >> 1)) return null;
+      let predictor = view.getInt16(5, true), index = Math.min(88, bytes[7]);
+      const output = new Float32Array(count);
+      for (let i = 0; i < count; i++) {
+        const packed = bytes[8 + (i >> 1)];
+        const code = (i & 1) ? ((packed >> 4) & 15) : (packed & 15);
+        const step = IMA_STEP[index];
+        let delta = step >> 3;
+        if (code & 4) delta += step;
+        if (code & 2) delta += step >> 1;
+        if (code & 1) delta += step >> 2;
+        predictor += (code & 8) ? -delta : delta;
+        predictor = Math.max(-32768, Math.min(32767, predictor));
+        index = Math.max(0, Math.min(88, index + IMA_INDEX[code]));
+        output[i] = predictor / 32768;
+      }
+      return output;
+    }
+    if (type === 2) {
+      if (bytes.length < 5 + count * 2) return null;
+      const output = new Float32Array(count);
+      for (let i = 0; i < count; i++) output[i] = view.getInt16(5 + i * 2, true) / 32768;
+      return output;
+    }
+    return null;
+  }
+  function play(samples) {
+    if (!audio || !gain) return;
+    const now = audio.currentTime;
+    if (nextTime < now + 0.05) nextTime = now + 0.12;
+    if (nextTime - now > 0.9) return;
+    const buffer = audio.createBuffer(1, samples.length, sampleRate);
+    buffer.copyToChannel(samples, 0);
+    const source = audio.createBufferSource();
+    source.buffer = buffer;
+    source.connect(gain);
+    source.start(nextTime);
+    nextTime += buffer.duration;
+  }
+  function updateMeter(samples) {
+    let energy = 0;
+    for (let i = 0; i < samples.length; i++) energy += samples[i] * samples[i];
+    const rms = Math.sqrt(energy / samples.length);
+    levelEl.style.width = `${Math.min(100, Math.round(Math.sqrt(rms) * 260))}%`;
+  }
+  async function getListenerToken(password) {
+    const response = await fetch(`${API}/api/auth/listener`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password })
+    });
+    if (!response.ok) {
+      let message = `Authentication failed (HTTP ${response.status}).`;
+      try { const data = await response.json(); if (data.error) message = data.error; } catch (_) {}
+      throw new Error(message);
+    }
+    const data = await response.json();
+    if (typeof data.token !== "string" || !data.token) throw new Error("The relay did not return a valid session token.");
+    return data.token;
+  }
+  function connect(token) {
+    return new Promise((resolve, reject) => {
+      ended = false;
+      const wsUrl = API.replace(/^https:/, "wss:").replace(/^http:/, "ws:") + "/api/listener";
+      socket = new WebSocket(wsUrl, [`as-token.${token}`]);
+      socket.binaryType = "arraybuffer";
+      let opened = false;
+      socket.onopen = () => {
+        opened = true;
+        sessionStartedAt = Date.now();
+        setConnected(true);
+        say("Connected. Live audio is starting…");
+        timerHandle = window.setInterval(() => {
+          const remaining = Math.max(0, MAX_SESSION_SECONDS - Math.floor((Date.now() - sessionStartedAt) / 1000));
+          timerEl.textContent = `Maximum session: ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")} remaining`;
+        }, 1000);
+        resolve();
+      };
+      socket.onmessage = event => {
+        if (typeof event.data === "string") {
+          if (event.data === "DEVICE_DISCONNECTED") {
+            say("The Audio Sentinel device disconnected.");
+            ended = true;
+            return;
+          }
+          try {
+            const message = JSON.parse(event.data);
+            if (message.t === "hello" && Number.isFinite(message.rate)) sampleRate = message.rate;
+          } catch (_) {}
+          return;
+        }
+        const frame = decodeFrame(new Uint8Array(event.data));
+        if (frame) { play(frame); updateMeter(frame); }
+      };
+      socket.onerror = () => {
+        if (!opened) reject(new Error("Could not connect to the relay. Check that /live is running and try again."));
+        else say("Connection problem.");
+      };
+      socket.onclose = event => {
+        window.clearInterval(timerHandle);
+        setConnected(false);
+        levelEl.style.width = "0";
+        if (!ended && event.code !== 1000) say(`Connection closed (${event.code}). Start /live on the device and try again.`);
+        else if (!ended) say("Live session ended.");
+        ended = true;
+        if (!opened) reject(new Error("The relay closed the connection before it opened."));
+      };
+    });
+  }
+
+  listenBtn.addEventListener("click", async () => {
+    const password = passwordEl.value;
+    if (!password) { say("Enter the listener password first."); passwordEl.focus(); return; }
+    listenBtn.disabled = true;
+    say("Authenticating…");
+    try {
+      const token = await getListenerToken(password);
+      passwordEl.value = "";
+      if (!audio) {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextClass) throw new Error("This browser does not support Web Audio.");
+        audio = new AudioContextClass();
+        gain = audio.createGain();
+        gain.connect(audio.destination);
+      }
+      await audio.resume();
+      gain.gain.value = Number($("volume").value) / 100;
+      await connect(token);
+      try { if (navigator.wakeLock) await navigator.wakeLock.request("screen"); } catch (_) {}
+    } catch (error) {
+      say(error.message || "Could not start listening.");
+      listenBtn.disabled = false;
+    }
+  });
+  stopBtn.addEventListener("click", () => {
+    say("Ending session…");
+    if (socket && socket.readyState === WebSocket.OPEN) socket.send("STOP");
+    else if (socket) socket.close();
+  });
+  $("volume").addEventListener("input", event => {
+    if (gain) gain.gain.value = Number(event.target.value) / 100;
+  });
+})();
+</script>
+</body>
+</html>
